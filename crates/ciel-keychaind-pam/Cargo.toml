@@ -1,0 +1,37 @@
+# ==============================================================================
+# ciel-keychaind-pam - Linux PAM Module Manifest
+#
+# Compiles as a dynamic C-compatible shared object (`pam_ciel_keychaind.so` / cdylib)
+# loaded into the PAM authentication stack via `/etc/pam.d/*`.
+#
+# Constraints & Architecture:
+# - Crate type `cdylib` exports standard C ABI entry points (`pam_sm_*`).
+# - Minimal dependencies to prevent binary bloat and minimize initialization
+#   overhead inside critical system authentication stacks (GDM, LightDM, login).
+# - Zeroize guarantees that captured user authentication tokens are securely
+#   scrubbed from stack and heap memory before returning to the PAM caller.
+# ==============================================================================
+
+[package]
+name = "ciel-keychaind-pam"
+description = "Linux PAM module for automatically unlocking ciel-keychaind on user login"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+# Builds the shared library (pam_ciel_keychaind.so) for dynamic linking by libpam
+name = "pam_ciel_keychaind"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Shared wire protocol for formatting messages sent over the private UNIX socket
+ciel-keychaind-proto = { version = "0.1.0", path = "../ciel-keychaind-proto" }
+
+# Low-level POSIX and PAM C-ABI types (getpwnam_r, passwd, c_int, etc.)
+libc = { workspace = true }
+
+# Memory zeroization ensuring passphrases are overwritten in RAM
+zeroize = { workspace = true, features = ["alloc"] }

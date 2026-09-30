@@ -1,0 +1,8 @@
+# In auth section (after pam_unix.so):
+auth    optional    pam_secretd.so
+
+# In session section (after pam_systemd.so):
+session optional    pam_secretd.so auto_start
+
+# In password section (after pam_unix.so):
+password optional   pam_secretd.so

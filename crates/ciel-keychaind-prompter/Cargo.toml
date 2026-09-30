@@ -1,0 +1,47 @@
+# ==============================================================================
+# ciel-keychaind-prompter - Prompter D-Bus Mediator Manifest
+#
+# Standalone binary serving the `org.freedesktop.secrets.Prompter` interface
+# on the session D-Bus.
+#
+# Architecture & Responsibilities:
+# - Acts as an asynchronous broker relaying authentication and authorization
+#   requests from the core `ciel-keychaind` daemon to external desktop UI engines.
+# - Emits D-Bus signals (`UnlockPromptRequested`, `AuthorizePromptRequested`)
+#   consumed by desktop shells (GNOME Shell, KDE, custom UI agents) to present
+#   native modal dialogs.
+# - Collects and returns user approvals and zeroized passphrases back to `ciel-keychaind`.
+# ==============================================================================
+
+[package]
+name = "ciel-keychaind-prompter"
+description = "Desktop prompter D-Bus mediator for ciel-keychaind"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ciel-keychaind-prompter"
+path = "src/main.rs"
+
+[dependencies]
+# Shared wire protocol and prompter constants
+ciel-keychaind-proto = { path = "../ciel-keychaind-proto" }
+
+# Asynchronous runtime and execution primitives
+tokio = { workspace = true }
+
+# Session D-Bus communication (org.freedesktop.secrets.Prompter)
+zbus = { workspace = true }
+
+# Guaranteed memory zeroization for received passphrases
+zeroize = { workspace = true, features = ["alloc"] }
+
+# Structured logging and diagnostics
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# System-level process hardening (prctl PR_SET_DUMPABLE)
+libc = { workspace = true }

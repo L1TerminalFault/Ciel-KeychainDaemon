@@ -1,0 +1,26 @@
+# ==============================================================================
+# ciel-keychaind-proto - Shared Protocol & Wire Types Manifest
+#
+# Lightweight, shared crate containing data structures, wire framing contracts,
+# and D-Bus constants shared across `ciel-keychaind`, `ciel-keychaind-pam`, `ciel-keychaind-prompter`,
+# and `ciel-keychainctl`.
+#
+# Designed with minimal dependencies to ensure fast compilation and zero heavy
+# transitive dependencies for the PAM shared object (`pam_ciel_keychaind.so`).
+# ==============================================================================
+
+[package]
+name = "ciel-keychaind-proto"
+description = "Shared protocol types and IPC wire formats for ciel-keychaind"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Serialization support for message wire encoding
+serde = { workspace = true, features = ["derive"] }
+
+# Memory zeroization for secret buffers and passphrases
+zeroize = { workspace = true, features = ["derive", "alloc"] }

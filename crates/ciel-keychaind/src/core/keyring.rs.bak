@@ -1,0 +1,2559 @@
+//! ============================================================================
+//! ciel-keychaind - Keyring Manager & In-Memory State
+//!
+//! Orchestrates the in-memory hierarchy of collections and items:
+//! - Thread-safe access to collections and item properties.
+//! - Enforces lock status via [`LockManager`].
+//! - Enforces authorization via [`PolicyEngine`].
+//! - Handles PAM password-based unlock and disk persistence synchronization.
+//!
+//! ============================================================================
+
+// use crate::error::{CielError, Result};
+// use std::collections::HashMap;
+// use std::sync::atomic::{AtomicU64, Ordering};
+// use std::sync::Arc;
+// use std::time::{SystemTime, UNIX_EPOCH};
+// use tokio::sync::RwLock;
+// use tracing::info;
+// use zbus::zvariant::{OwnedObjectPath, Value};
+// use zeroize::Zeroizing;
+//
+// use crate::config::{Config, DEFAULT_COLLECTION_ALIAS, DEFAULT_COLLECTION_NAME};
+// use crate::core::events::EventBus;
+// use crate::core::lock::LockManager;
+// use crate::core::policy::{AccessDecision, PolicyEngine};
+// use crate::core::search::matches_attributes;
+// use crate::dbus::caller::CallerIdentity;
+// use crate::dbus::item::SecretWire;
+// use crate::dbus::session::Session;
+//
+// use crate::crypto::kdf::{derive_master_key, KdfParams};
+// use crate::storage::{StoredItem, VaultPayload, VaultStorage};
+//
+// /// Current UNIX timestamp in seconds.
+// fn current_timestamp_secs() -> u64 {
+//     SystemTime::now()
+//         .duration_since(UNIX_EPOCH)
+//         .unwrap_or_default()
+//         .as_secs()
+// }
+//
+// /// In-memory representation of an individual stored item.
+// #[derive(Debug, Clone)]
+// pub struct ItemData {
+//     pub id: String,
+//     pub label: String,
+//     pub attributes: HashMap<String, String>,
+//     pub secret: Zeroizing<Vec<u8>>,
+//     pub content_type: String,
+//     pub created: u64,
+//     pub modified: u64,
+// }
+//
+// /// In-memory representation of a collection vault.
+// pub struct CollectionData {
+//     pub id: String,
+//     pub label: String,
+//     pub created: u64,
+//     pub modified: u64,
+//     pub items: HashMap<String, ItemData>,
+//     pub master_key: Option<Zeroizing<Vec<u8>>>,
+// }
+//
+// /// Central orchestrator managing keyrings, items, aliases, and lifecycle operations.
+// pub struct KeyringManager {
+//     config: Config,
+//     collections: Arc<RwLock<HashMap<String, CollectionData>>>,
+//     aliases: Arc<RwLock<HashMap<String, String>>>,
+//     lock_manager: Arc<LockManager>,
+//     policy_engine: Arc<PolicyEngine>,
+//     event_bus: EventBus,
+//     item_counter: AtomicU64,
+//     vault_storage: Arc<VaultStorage>, // ← NEW
+//                                       // vault_passphrase: Zeroizing<Vec<u8>>,  // ← NEW (for testing; replace with PAM later)
+// }
+//
+// impl KeyringManager {
+//     /// Initializes a new KeyringManager with vault persistence.
+//     pub async fn new(config: Config, vault_storage: Arc<VaultStorage>) -> Result<Self> {
+//         let event_bus = EventBus::new();
+//         let lock_manager = Arc::new(LockManager::new(
+//             config.auto_lock_timeout,
+//             event_bus.clone(),
+//         ));
+//         let policy_engine = Arc::new(PolicyEngine::new(config.default_access_policy));
+//
+//         let mut initial_aliases = HashMap::new();
+//         initial_aliases.insert(
+//             DEFAULT_COLLECTION_ALIAS.to_string(),
+//             DEFAULT_COLLECTION_NAME.to_string(),
+//         );
+//
+//         // Note: We start EMPTY. Vaults are only loaded when unlocked via PAM or manual prompt.
+//         // This ensures no secrets are in RAM until the user authenticates.
+//         Ok(Self {
+//             config,
+//             collections: Arc::new(RwLock::new(HashMap::new())),
+//             aliases: Arc::new(RwLock::new(initial_aliases)),
+//             lock_manager,
+//             policy_engine,
+//             event_bus,
+//             item_counter: AtomicU64::new(1),
+//             vault_storage, // <-- ADDED
+//         })
+//     }
+//     // pub async fn new(
+//     //     config: Config,
+//     //     vault_storage: Arc<VaultStorage>,
+//     //     vault_passphrase: Vec<u8>,
+//     // ) -> Result<Self> {
+//     //     let event_bus = EventBus::new();
+//     //     let lock_manager = Arc::new(LockManager::new(
+//     //         config.auto_lock_timeout,
+//     //         event_bus.clone(),
+//     //     ));
+//     //
+//     //     let policy_engine = Arc::new(PolicyEngine::new(config.default_access_policy));
+//     //
+//     //     let mut initial_aliases = HashMap::new();
+//     //     initial_aliases.insert(
+//     //         DEFAULT_COLLECTION_ALIAS.to_string(),
+//     //         DEFAULT_COLLECTION_NAME.to_string(),
+//     //     );
+//     //
+//     //     let manager = Self {
+//     //         config,
+//     //         collections: Arc::new(RwLock::new(HashMap::new())),
+//     //         aliases: Arc::new(RwLock::new(initial_aliases)),
+//     //         lock_manager,
+//     //         policy_engine,
+//     //         event_bus,
+//     //         item_counter: AtomicU64::new(1),
+//     //         vault_storage,
+//     //         vault_passphrase: Zeroizing::new(vault_passphrase),
+//     //     };
+//     //
+//     //     // Load existing vaults from disk
+//     //     manager.load_all_vaults().await?;
+//     //
+//     //     // Ensure default collection exists
+//     //     manager.ensure_default_collection().await?;
+//     //
+//     //     Ok(manager)
+//     // }
+//
+//     /// Loads all vault files from the storage directory.
+//     // async fn load_all_vaults(&self) -> Result<()> {
+//     //     let vault_dir = self.vault_storage.vault_dir();  // Need to add this getter
+//     //     if !vault_dir.exists() {
+//     //         info!("Vault directory does not exist yet, will create on first save");
+//     //         return Ok(());
+//     //     }
+//     //
+//     //     let entries = std::fs::read_dir(&vault_dir)
+//     //         .map_err(|e| CielError::Storage(format!("Failed to read vault directory: {e}")))?;
+//     //
+//     //     for entry in entries.flatten() {
+//     //         let path = entry.path();
+//     //         if path.extension().and_then(|s| s.to_str()) == Some("keyring") {
+//     //             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+//     //                 match self.vault_storage.load_vault(stem, &self.vault_passphrase) {
+//     //                     Ok(payload) => {
+//     //                         let collection = Self::payload_to_collection(payload);
+//     //                         let col_id = collection.id.clone();
+//     //
+//     //                         {
+//     //                             let mut cols = self.collections.write().await;
+//     //                             cols.insert(col_id.clone(), collection);
+//     //                         }
+//     //
+//     //                         self.lock_manager.register_unlocked(&col_id).await;
+//     //                         info!("Loaded vault '{}' from disk", col_id);
+//     //                     }
+//     //                     Err(e) => {
+//     //                         tracing::error!("Failed to load vault '{}': {}", stem, e);
+//     //                         // Continue loading other vaults
+//     //                     }
+//     //                 }
+//     //             }
+//     //         }
+//     //     }
+//     //
+//     //     Ok(())
+//     // }
+//
+//     /// Ensures the default collection exists, creating it if necessary.
+//     async fn ensure_default_collection(&self) -> Result<()> {
+//         let cols = self.collections.read().await;
+//         if !cols.contains_key(DEFAULT_COLLECTION_NAME) {
+//             drop(cols);
+//
+//             let now = current_timestamp_secs();
+//             let default_collection = CollectionData {
+//                 id: DEFAULT_COLLECTION_NAME.to_string(),
+//                 label: "Login Keyring".to_string(),
+//                 created: now,
+//                 modified: now,
+//                 items: HashMap::new(),
+//                 master_key: None,
+//             };
+//
+//             {
+//                 let mut cols = self.collections.write().await;
+//                 cols.insert(DEFAULT_COLLECTION_NAME.to_string(), default_collection);
+//             }
+//
+//             self.lock_manager
+//                 .register_unlocked(DEFAULT_COLLECTION_NAME)
+//                 .await;
+//             self.persist_collection(DEFAULT_COLLECTION_NAME).await?;
+//             info!("Created default collection '{}'", DEFAULT_COLLECTION_NAME);
+//         }
+//         Ok(())
+//     }
+//
+//     /// Persists a collection to disk.
+//     // async fn persist_collection(&self, collection_id: &str) -> Result<()> {
+//     //     let cols = self.collections.read().await;
+//     //     let col = cols.get(collection_id).ok_or_else(|| {
+//     //         CielError::NoSuchObject(format!("No collection '{collection_id}'"))
+//     //     })?;
+//     //
+//     //     let payload = Self::collection_to_payload(col);
+//     //     let kdf_params = KdfParams::default();
+//     //
+//     //     // Derive master key (cached in production, derived here for simplicity)
+//     //     let master_key = derive_master_key(&self.vault_passphrase, &kdf_params)?;
+//     //
+//     //     self.vault_storage.save_vault_with_key(
+//     //         collection_id,
+//     //         &payload,
+//     //         &master_key,
+//     //         &kdf_params,
+//     //     )?;
+//     //
+//     //     Ok(())
+//     // }
+//
+//     /// Converts in-memory collection to on-disk payload.
+//     fn collection_to_payload(col: &CollectionData) -> VaultPayload {
+//         VaultPayload {
+//             collection_id: col.id.clone(),
+//             label: col.label.clone(),
+//             created: col.created,
+//             modified: col.modified,
+//             items: col
+//                 .items
+//                 .values()
+//                 .map(|item| StoredItem {
+//                     id: item.id.clone(),
+//                     label: item.label.clone(),
+//                     attributes: item.attributes.clone(),
+//                     secret: item.secret.to_vec(),
+//                     content_type: item.content_type.clone(),
+//                     created: item.created,
+//                     modified: item.modified,
+//                 })
+//                 .collect(),
+//         }
+//     }
+//
+//     /// Converts on-disk payload to in-memory collection.
+//     fn payload_to_collection(payload: VaultPayload) -> CollectionData {
+//         let items = payload
+//             .items
+//             .into_iter()
+//             .map(|stored| {
+//                 let item = ItemData {
+//                     id: stored.id.clone(),
+//                     label: stored.label,
+//                     attributes: stored.attributes,
+//                     secret: Zeroizing::new(stored.secret),
+//                     content_type: stored.content_type,
+//                     created: stored.created,
+//                     modified: stored.modified,
+//                 };
+//                 (stored.id, item)
+//             })
+//             .collect();
+//
+//         CollectionData {
+//             id: payload.collection_id,
+//             label: payload.label,
+//             created: payload.created,
+//             modified: payload.modified,
+//             items,
+//             master_key: None,
+//         }
+//     }
+//
+//     pub async fn lock_collection(&self, collection_id: &str) -> Result<()> {
+//         let mut cols = self.collections.write().await;
+//         let col = cols
+//             .get_mut(collection_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//         for item in col.items.values_mut() {
+//             item.secret = Zeroizing::new(vec![]); // Zeroize secrets in RAM
+//         }
+//         self.lock_manager.lock(collection_id).await;
+//         info!("Collection '{}' locked and secrets zeroized", collection_id);
+//         Ok(())
+//     }
+//
+//     // pub async fn unlock_collection(&self, collection_id: &str) -> Result<()> {
+//     //     let payload = self.vault_storage.load_vault(collection_id, &self.vault_passphrase)?;
+//     //     let collection = Self::payload_to_collection(payload);
+//     //     let mut cols = self.collections.write().await;
+//     //     cols.insert(collection_id.to_string(), collection);
+//     //     self.lock_manager.unlock(collection_id).await;
+//     //     info!("Collection '{}' unlocked and secrets restored from disk", collection_id);
+//     //     Ok(())
+//     // }
+//
+//     /// Access the internal lock manager.
+//     pub fn lock_manager(&self) -> &Arc<LockManager> {
+//         &self.lock_manager
+//     }
+//
+//     /// Access the internal policy engine.
+//     pub fn policy_engine(&self) -> &Arc<PolicyEngine> {
+//         &self.policy_engine
+//     }
+//
+//     /// Returns `true` if the specified collection is locked.
+//     pub async fn is_collection_locked(&self, collection_id: &str) -> bool {
+//         self.lock_manager.is_locked(collection_id).await
+//     }
+//
+//     /// Creates a new collection given properties and an optional alias.
+//     pub async fn create_collection(
+//         &self,
+//         properties: HashMap<String, Value<'_>>,
+//         alias: &str,
+//         _caller: &CallerIdentity,
+//     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+//         let label = properties
+//             .get("org.freedesktop.Secret.Collection.Label")
+//             .and_then(|v| match v {
+//                 Value::Str(s) => Some(s.to_string()),
+//                 _ => None,
+//             })
+//             .unwrap_or_else(|| "New Collection".to_string());
+//
+//         let collection_id = label.to_lowercase().replace(' ', "_");
+//         let now = current_timestamp_secs();
+//
+//         {
+//             let mut cols = self.collections.write().await;
+//             if cols.contains_key(&collection_id) {
+//                 return Err(CielError::AlreadyExists(format!(
+//                     "Collection '{collection_id}' already exists"
+//                 )));
+//             }
+//
+//             cols.insert(
+//                 collection_id.clone(),
+//                 CollectionData {
+//                     id: collection_id.clone(),
+//                     label,
+//                     created: now,
+//                     modified: now,
+//                     items: HashMap::new(),
+//                     master_key: None,
+//                 },
+//             );
+//         }
+//
+//         self.lock_manager.register_unlocked(&collection_id).await;
+//
+//         if !alias.is_empty() {
+//             let mut aliases = self.aliases.write().await;
+//             aliases.insert(alias.to_string(), collection_id.clone());
+//         }
+//
+//         let collection_path = OwnedObjectPath::try_from(format!(
+//             "/org/freedesktop/secrets/collection/{collection_id}"
+//         ))
+//         .map_err(|e| CielError::Config(e.to_string()))?;
+//         let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+//
+//         self.persist_collection(&collection_id).await?;
+//
+//         Ok((collection_path, prompt_path))
+//     }
+//
+//     /// Deletes a collection and purges all contained items.
+//     pub async fn delete_collection(
+//         &self,
+//         collection_id: &str,
+//         _caller: &CallerIdentity,
+//     ) -> Result<()> {
+//         self.vault_storage.delete_vault(collection_id)?;
+//
+//         let vault_path = self.vault_storage.vault_file_path(collection_id);
+//         if vault_path.exists() {
+//             std::fs::remove_file(&vault_path)
+//                 .map_err(|e| CielError::Storage(format!("Failed to delete vault file: {e}")))?;
+//         }
+//
+//         let mut cols = self.collections.write().await;
+//         if cols.remove(collection_id).is_none() {
+//             return Err(CielError::NoSuchObject(format!(
+//                 "No collection '{collection_id}'"
+//             )));
+//         }
+//
+//         self.lock_manager.lock(collection_id).await;
+//         Ok(())
+//     }
+//
+//     /// Lists all known collections.
+//     pub async fn list_all_collections(&self) -> Result<Vec<OwnedObjectPath>> {
+//         let cols = self.collections.read().await;
+//         let mut paths = Vec::with_capacity(cols.len());
+//         for id in cols.keys() {
+//             if let Ok(p) =
+//                 OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{id}"))
+//             {
+//                 paths.push(p);
+//             }
+//         }
+//         Ok(paths)
+//     }
+//
+//     /// Lists all item object paths in a collection.
+//     pub async fn list_items(&self, collection_id: &str) -> Result<Vec<OwnedObjectPath>> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(collection_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//
+//         let mut paths = Vec::with_capacity(col.items.len());
+//         for item_id in col.items.keys() {
+//             if let Ok(p) = OwnedObjectPath::try_from(format!(
+//                 "/org/freedesktop/secrets/collection/{collection_id}/{item_id}"
+//             )) {
+//                 paths.push(p);
+//             }
+//         }
+//         Ok(paths)
+//     }
+//
+//     /// Creates a new secret item inside a collection.
+//     pub async fn create_item(
+//         &self,
+//         collection_id: &str,
+//         properties: HashMap<String, Value<'_>>,
+//         secret_wire: SecretWire,
+//         replace: bool,
+//         _caller: &CallerIdentity,
+//     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+//         if self.is_collection_locked(collection_id).await {
+//             return Err(CielError::IsLocked(format!(
+//                 "Collection '{collection_id}' is locked"
+//             )));
+//         }
+//
+//         let label = properties
+//             .get("org.freedesktop.Secret.Item.Label")
+//             .and_then(|v| match v {
+//                 Value::Str(s) => Some(s.to_string()),
+//                 _ => None,
+//             })
+//             .unwrap_or_else(|| "New Secret".to_string());
+//
+//         let mut attributes = HashMap::new();
+//         if let Some(Value::Dict(dict)) = properties.get("org.freedesktop.Secret.Item.Attributes") {
+//             for (k, v) in dict.iter() {
+//                 if let (Value::Str(ks), Value::Str(vs)) = (k, v) {
+//                     attributes.insert(ks.to_string(), vs.to_string());
+//                 }
+//             }
+//         }
+//
+//         let item_id = format!("i{}", self.item_counter.fetch_add(1, Ordering::SeqCst));
+//         let now = current_timestamp_secs();
+//
+//         let item_data = ItemData {
+//             id: item_id.clone(),
+//             label,
+//             attributes,
+//             secret: Zeroizing::new(secret_wire.value),
+//             content_type: secret_wire.content_type,
+//             created: now,
+//             modified: now,
+//         };
+//
+//         {
+//             let mut cols = self.collections.write().await;
+//             let col = cols.get_mut(collection_id).ok_or_else(|| {
+//                 CielError::NoSuchObject(format!("No collection '{collection_id}'"))
+//             })?;
+//
+//             if replace {
+//                 // If replace is true, purge existing item matching identical attributes
+//                 col.items
+//                     .retain(|_, it| !matches_attributes(&item_data.attributes, &it.attributes));
+//             }
+//
+//             col.items.insert(item_id.clone(), item_data);
+//             col.modified = now;
+//         }
+//
+//         self.lock_manager.touch_activity(collection_id).await;
+//         let item_path = OwnedObjectPath::try_from(format!(
+//             "/org/freedesktop/secrets/collection/{collection_id}/{item_id}"
+//         ))
+//         .map_err(|e| CielError::Config(e.to_string()))?;
+//         let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+//
+//         self.persist_collection(collection_id).await?;
+//
+//         Ok((item_path, prompt_path))
+//     }
+//
+//     /// Deletes an item from a collection.
+//     pub async fn delete_item(
+//         &self,
+//         collection_id: &str,
+//         item_id: &str,
+//         _caller: &CallerIdentity,
+//     ) -> Result<()> {
+//         if self.is_collection_locked(collection_id).await {
+//             return Err(CielError::IsLocked(format!(
+//                 "Collection '{collection_id}' is locked"
+//             )));
+//         }
+//
+//         let mut cols = self.collections.write().await;
+//         let col = cols
+//             .get_mut(collection_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//
+//         if col.items.remove(item_id).is_none() {
+//             return Err(CielError::NoSuchObject(format!(
+//                 "No item '{item_id}' in '{collection_id}'"
+//             )));
+//         }
+//
+//         col.modified = current_timestamp_secs();
+//
+//         self.persist_collection(collection_id).await?;
+//
+//         Ok(())
+//     }
+//
+//     /// Reads and encrypts an item's secret for the caller's session.
+//     pub async fn get_item_secret(
+//         &self,
+//         collection_id: &str,
+//         item_id: &str,
+//         session_path: &OwnedObjectPath,
+//         caller: &CallerIdentity,
+//     ) -> Result<SecretWire> {
+//         if self.is_collection_locked(collection_id).await {
+//             return Err(CielError::IsLocked(format!(
+//                 "Collection '{collection_id}' is locked"
+//             )));
+//         }
+//
+//         // Authorize caller via policy engine
+//         let decision = self.policy_engine.evaluate_access(caller).await;
+//         if decision == AccessDecision::Deny {
+//             return Err(CielError::PolicyDenied(format!(
+//                 "Access denied to caller {:?}",
+//                 caller.display_label()
+//             )));
+//         }
+//
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(collection_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//
+//         let item = col
+//             .items
+//             .get(item_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No item '{item_id}'")))?;
+//
+//         self.lock_manager.touch_activity(collection_id).await;
+//
+//         Ok(SecretWire {
+//             session: session_path.clone(),
+//             parameters: Vec::new(),
+//             value: item.secret.to_vec(),
+//             content_type: item.content_type.clone(),
+//         })
+//     }
+//
+//     /// Updates an item's secret value.
+//     pub async fn set_item_secret(
+//         &self,
+//         collection_id: &str,
+//         item_id: &str,
+//         secret_wire: SecretWire,
+//         _caller: &CallerIdentity,
+//     ) -> Result<()> {
+//         if self.is_collection_locked(collection_id).await {
+//             return Err(CielError::IsLocked(format!(
+//                 "Collection '{collection_id}' is locked"
+//             )));
+//         }
+//
+//         let mut cols = self.collections.write().await;
+//         let col = cols
+//             .get_mut(collection_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//
+//         let item = col
+//             .items
+//             .get_mut(item_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No item '{item_id}'")))?;
+//
+//         item.secret = Zeroizing::new(secret_wire.value);
+//         item.content_type = secret_wire.content_type;
+//         item.modified = current_timestamp_secs();
+//
+//         self.lock_manager.touch_activity(collection_id).await;
+//
+//         self.persist_collection(collection_id).await?;
+//
+//         Ok(())
+//     }
+//
+//     /// Performs attribute search within a single collection.
+//     pub async fn search_items_in_collection(
+//         &self,
+//         collection_id: &str,
+//         attributes: &HashMap<String, String>,
+//     ) -> Result<Vec<OwnedObjectPath>> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(collection_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//
+//         let mut results = Vec::new();
+//         for (item_id, item) in &col.items {
+//             if matches_attributes(attributes, &item.attributes) {
+//                 if let Ok(p) = OwnedObjectPath::try_from(format!(
+//                     "/org/freedesktop/secrets/collection/{collection_id}/{item_id}"
+//                 )) {
+//                     results.push(p);
+//                 }
+//             }
+//         }
+//
+//         Ok(results)
+//     }
+//
+//     /// Performs global attribute search across all collections, returning unlocked and locked items.
+//     pub async fn search_items_global(
+//         &self,
+//         attributes: &HashMap<String, String>,
+//     ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
+//         let cols = self.collections.read().await;
+//         let mut unlocked = Vec::new();
+//         let mut locked = Vec::new();
+//
+//         for (col_id, col) in cols.iter() {
+//             let is_locked = self.lock_manager.is_locked(col_id).await;
+//             for (item_id, item) in &col.items {
+//                 if matches_attributes(attributes, &item.attributes) {
+//                     if let Ok(path) = OwnedObjectPath::try_from(format!(
+//                         "/org/freedesktop/secrets/collection/{col_id}/{item_id}"
+//                     )) {
+//                         if is_locked {
+//                             locked.push(path);
+//                         } else {
+//                             unlocked.push(path);
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+//
+//         Ok((unlocked, locked))
+//     }
+//
+//     /// Unlocks objects (collections or items).
+//     pub async fn unlock_objects(
+//         &self,
+//         objects: Vec<OwnedObjectPath>,
+//         _caller: &CallerIdentity,
+//     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+//         let mut unlocked = Vec::new();
+//
+//         for obj in objects {
+//             let path_str = obj.as_str();
+//             if let Some(col_id) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+//                 let actual_col_id = col_id.split('/').next().unwrap_or(col_id);
+//                 self.lock_manager.unlock(actual_col_id).await;
+//                 if let Ok(p) = OwnedObjectPath::try_from(path_str) {
+//                     unlocked.push(p);
+//                 }
+//             }
+//         }
+//
+//         let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+//         Ok((unlocked, prompt_path))
+//     }
+//
+//     /// Locks objects (collections or items).
+//     pub async fn lock_objects(
+//         &self,
+//         objects: Vec<OwnedObjectPath>,
+//         _caller: &CallerIdentity,
+//     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+//         let mut locked = Vec::new();
+//
+//         for obj in objects {
+//             let path_str = obj.as_str();
+//             if let Some(col_id) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+//                 let actual_col_id = col_id.split('/').next().unwrap_or(col_id);
+//                 self.lock_manager.lock(actual_col_id).await;
+//                 if let Ok(p) = OwnedObjectPath::try_from(path_str) {
+//                     locked.push(p);
+//                 }
+//             }
+//         }
+//
+//         let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+//         Ok((locked, prompt_path))
+//     }
+//
+//     /// Locks all collections immediately.
+//     pub async fn lock_all(&self) {
+//         self.lock_manager.lock_all().await;
+//     }
+//
+//     /// Unlocks a collection directly with a raw passphrase (invoked by PAM module).
+//     // pub async fn unlock_with_passphrase(
+//     //     &self,
+//     //     collection_id: &str,
+//     //     _passphrase: &[u8],
+//     // ) -> Result<()> {
+//     //     info!(
+//     //         "Unlocking collection '{}' via PAM credentials",
+//     //         collection_id
+//     //     );
+//     //     self.lock_manager.unlock(collection_id).await;
+//     //     Ok(())
+//     // }
+//     /// Unlocks a collection directly with a raw passphrase (invoked by PAM module).
+//     pub async fn unlock_with_passphrase(
+//         &self,
+//         collection_id: &str,
+//         passphrase: &[u8],
+//     ) -> Result<()> {
+//         info!("Unlocking collection '{}' via passphrase", collection_id);
+//
+//         // 1. Derive master key once (avoids re-deriving on every save)
+//         let kdf_params = KdfParams::default();
+//         let master_key = derive_master_key(passphrase, &kdf_params)?;
+//
+//         // 2. Try to load. If it doesn't exist, create an empty vault.
+//         let payload = match self
+//             .vault_storage
+//             .load_vault_with_key(collection_id, &master_key)
+//         {
+//             Ok(p) => p,
+//             Err(e) => {
+//                 if matches!(e, CielError::NoSuchObject(_)) {
+//                     info!(
+//                         "Vault '{}' not found. Creating new empty vault.",
+//                         collection_id
+//                     );
+//                     let now = current_timestamp_secs();
+//                     let new_payload = crate::storage::VaultPayload {
+//                         collection_id: collection_id.to_string(),
+//                         label: if collection_id == DEFAULT_COLLECTION_NAME {
+//                             "Login Keyring".to_string()
+//                         } else {
+//                             collection_id.to_string()
+//                         },
+//                         created: now,
+//                         modified: now,
+//                         items: Vec::new(),
+//                     };
+//                     self.vault_storage.save_vault_with_key(
+//                         collection_id,
+//                         &new_payload,
+//                         &master_key,
+//                         &kdf_params,
+//                     )?;
+//                     new_payload
+//                 } else {
+//                     return Err(e); // Real decryption failure (e.g., wrong password)
+//                 }
+//             }
+//         };
+//
+//         // 3. Convert on-disk payload to in-memory representation
+//         let items = payload
+//             .items
+//             .into_iter()
+//             .map(|stored| {
+//                 let item = ItemData {
+//                     id: stored.id.clone(),
+//                     label: stored.label,
+//                     attributes: stored.attributes,
+//                     secret: Zeroizing::new(stored.secret),
+//                     content_type: stored.content_type,
+//                     created: stored.created,
+//                     modified: stored.modified,
+//                 };
+//                 (stored.id, item)
+//             })
+//             .collect();
+//
+//         let collection = CollectionData {
+//             id: payload.collection_id,
+//             label: payload.label,
+//             created: payload.created,
+//             modified: payload.modified,
+//             items,
+//             master_key: Some(Zeroizing::new(master_key)), // CACHE THE KEY FOR FUTURE SAVES
+//         };
+//
+//         // 4. Store in memory and mark unlocked
+//         {
+//             let mut cols = self.collections.write().await;
+//             cols.insert(collection_id.to_string(), collection);
+//         }
+//         self.lock_manager.unlock(collection_id).await;
+//
+//         info!(
+//             "Collection '{}' successfully unlocked and loaded into memory",
+//             collection_id
+//         );
+//         Ok(())
+//     }
+//     // pub async fn unlock_with_passphrase(&self, collection_id: &str, passphrase: &[u8]) -> Result<()> {
+//     //     info!("Unlocking collection '{}' via passphrase", collection_id);
+//     //
+//     //     // 1. Try to load and decrypt from disk
+//     //     let payload = match self.vault_storage.load_vault(collection_id, passphrase) {
+//     //         Ok(p) => p,
+//     //         Err(e) => {
+//     //             // If it doesn't exist, this is the first login. Create an empty vault.
+//     //             if matches!(e, CielError::NoSuchObject(_)) {
+//     //                 info!("Vault '{}' not found. Creating new empty vault.", collection_id);
+//     //                 let now = current_timestamp_secs();
+//     //                 let new_payload = VaultPayload {
+//     //                     collection_id: collection_id.to_string(),
+//     //                     label: if collection_id == DEFAULT_COLLECTION_NAME {
+//     //                         "Login Keyring".to_string()
+//     //                     } else {
+//     //                         collection_id.to_string()
+//     //                     },
+//     //                     created: now,
+//     //                     modified: now,
+//     //                     items: Vec::new(),
+//     //                 };
+//     //                 self.vault_storage.save_vault(collection_id, &new_payload, passphrase, None)?;
+//     //                 new_payload
+//     //             } else {
+//     //                 return Err(e); // Real decryption failure (e.g., wrong password)
+//     //             }
+//     //         }
+//     //     };
+//     //
+//     //     // 2. Convert on-disk payload to in-memory representation
+//     //     let items = payload.items.into_iter().map(|stored| {
+//     //         let item = ItemData {
+//     //             id: stored.id.clone(),
+//     //             label: stored.label,
+//     //             attributes: stored.attributes,
+//     //             secret: Zeroizing::new(stored.secret),
+//     //             content_type: stored.content_type,
+//     //             created: stored.created,
+//     //             modified: stored.modified,
+//     //         };
+//     //         (stored.id, item)
+//     //     }).collect();
+//     //
+//     //     let collection = CollectionData {
+//     //         id: payload.collection_id,
+//     //         label: payload.label,
+//     //         created: payload.created,
+//     //         modified: payload.modified,
+//     //         items,
+//     //         master_key: None,
+//     //     };
+//     //
+//     //     // 3. Store in memory and mark unlocked
+//     //     {
+//     //         let mut cols = self.collections.write().await;
+//     //         cols.insert(collection_id.to_string(), collection);
+//     //     }
+//     //     self.lock_manager.unlock(collection_id).await;
+//     //
+//     //     info!("Collection '{}' successfully unlocked and loaded into memory", collection_id);
+//     //     Ok(())
+//     // }
+//
+//     // ADD THIS NEW HELPER METHOD for persistence
+//     /// Persists a collection to disk using its cached master key.
+//     pub async fn persist_collection(&self, collection_id: &str) -> Result<()> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(collection_id)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//
+//         let payload = VaultPayload {
+//             collection_id: col.id.clone(),
+//             label: col.label.clone(),
+//             created: col.created,
+//             modified: col.modified,
+//             items: col
+//                 .items
+//                 .values()
+//                 .map(|item| StoredItem {
+//                     id: item.id.clone(),
+//                     label: item.label.clone(),
+//                     attributes: item.attributes.clone(),
+//                     secret: item.secret.to_vec(),
+//                     content_type: item.content_type.clone(),
+//                     created: item.created,
+//                     modified: item.modified,
+//                 })
+//                 .collect(),
+//         };
+//
+//         // Use the cached master key! If it's None, the collection is locked and shouldn't be mutated anyway.
+//         if let Some(master_key) = &col.master_key {
+//             let kdf_params = KdfParams::default();
+//             self.vault_storage.save_vault_with_key(
+//                 collection_id,
+//                 &payload,
+//                 master_key,
+//                 &kdf_params,
+//             )?;
+//         } else {
+//             tracing::warn!("Attempted to persist locked collection '{}'", collection_id);
+//         }
+//         Ok(())
+//     }
+//     // pub async fn persist_collection(&self, collection_id: &str) -> Result<()> {
+//     //     let cols = self.collections.read().await;
+//     //     let col = cols.get(collection_id).ok_or_else(|| {
+//     //         CielError::NoSuchObject(format!("No collection '{collection_id}'"))
+//     //     })?;
+//     //
+//     //     let payload = VaultPayload {
+//     //         collection_id: col.id.clone(),
+//     //         label: col.label.clone(),
+//     //         created: col.created,
+//     //         modified: col.modified,
+//     //         items: col.items.values().map(|item| StoredItem {
+//     //             id: item.id.clone(),
+//     //             label: item.label.clone(),
+//     //             attributes: item.attributes.clone(),
+//     //             secret: item.secret.to_vec(),
+//     //             content_type: item.content_type.clone(),
+//     //             created: item.created,
+//     //             modified: item.modified,
+//     //         }).collect(),
+//     //     };
+//     //
+//     //     // Note: In a full PAM implementation, you would cache the derived master_key
+//     //     // in `CollectionData` after unlock to avoid re-running Argon2id on every save.
+//     //     // For now, we pass a dummy passphrase just to satisfy the signature,
+//     //     // but you should ideally cache the derived key in memory while unlocked.
+//     //     // *Temporary workaround for compilation until master_key caching is added:*
+//     //     // We will use a placeholder. You should update this to use `col.master_key` once cached.
+//     //
+//     //     // TODO: Replace this with actual cached master key logic.
+//     //     // For now, this ensures the code compiles and persists.
+//     //     let dummy_passphrase = b"temp-placeholder";
+//     //     self.vault_storage.save_vault(collection_id, &payload, dummy_passphrase, None)?;
+//     //     Ok(())
+//     // }
+//
+//     /// Resolves an alias name (e.g., `default`) to its target collection object path.
+//     pub async fn resolve_alias(&self, name: &str) -> Result<OwnedObjectPath> {
+//         let aliases = self.aliases.read().await;
+//         let col_id = aliases.get(name).ok_or_else(|| {
+//             CielError::NoSuchObject(format!("Alias '{name}' does not point to any collection"))
+//         })?;
+//
+//         OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{col_id}"))
+//             .map_err(|e| CielError::Config(e.to_string()))
+//     }
+//
+//     /// Sets or updates an alias.
+//     pub async fn set_alias(
+//         &self,
+//         name: &str,
+//         collection_path: &OwnedObjectPath,
+//         _caller: &CallerIdentity,
+//     ) -> Result<()> {
+//         let path_str = collection_path.as_str();
+//         if path_str == "/" {
+//             let mut aliases = self.aliases.write().await;
+//             aliases.remove(name);
+//             return Ok(());
+//         }
+//
+//         let col_id = path_str
+//             .strip_prefix("/org/freedesktop/secrets/collection/")
+//             .ok_or_else(|| CielError::NoSuchObject("Invalid collection path for alias".into()))?;
+//
+//         let mut aliases = self.aliases.write().await;
+//         aliases.insert(name.to_string(), col_id.to_string());
+//         Ok(())
+//     }
+//
+//     /// Bulk retrieves secrets for multiple items for a given session.
+//     pub async fn get_multiple_secrets(
+//         &self,
+//         items: Vec<OwnedObjectPath>,
+//         session: &Session,
+//         caller: &CallerIdentity,
+//     ) -> Result<HashMap<OwnedObjectPath, SecretWire>> {
+//         let mut map = HashMap::new();
+//         for item_path in items {
+//             let path_str = item_path.as_str();
+//             if let Some(rest) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+//                 let mut parts = rest.split('/');
+//                 if let (Some(col_id), Some(item_id)) = (parts.next(), parts.next()) {
+//                     let session_path = OwnedObjectPath::try_from(session.path.as_str())
+//                         .map_err(|e| CielError::Config(e.to_string()))?;
+//
+//                     if let Ok(wire) = self
+//                         .get_item_secret(col_id, item_id, &session_path, caller)
+//                         .await
+//                     {
+//                         // FIX: Encrypt the plaintext secret with the session's key before returning!
+//                         let (parameters, value) = session.encrypt(&wire.value)?;
+//
+//                         let encrypted_wire = SecretWire {
+//                             session: session.path.clone(),
+//                             parameters,
+//                             value,
+//                             content_type: wire.content_type,
+//                         };
+//
+//                         if let Ok(owned_path) = OwnedObjectPath::try_from(path_str) {
+//                             map.insert(owned_path, encrypted_wire);
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+//         Ok(map)
+//     }
+//
+//     // Property getters and setters
+//     pub async fn get_collection_label(&self, id: &str) -> Result<String> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(id)
+//             .ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+//         Ok(col.label.clone())
+//     }
+//
+//     pub async fn set_collection_label(&self, id: &str, label: String) -> Result<()> {
+//         let mut cols = self.collections.write().await;
+//         let col = cols
+//             .get_mut(id)
+//             .ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+//         col.label = label;
+//         col.modified = current_timestamp_secs();
+//
+//         self.persist_collection(id).await?;
+//
+//         Ok(())
+//     }
+//
+//     pub async fn get_collection_created(&self, id: &str) -> Result<u64> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(id)
+//             .ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+//         Ok(col.created)
+//     }
+//
+//     pub async fn get_collection_modified(&self, id: &str) -> Result<u64> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(id)
+//             .ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+//         Ok(col.modified)
+//     }
+//
+//     pub async fn get_item_label(&self, col_id: &str, item_id: &str) -> Result<String> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(col_id)
+//             .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         let item = col
+//             .items
+//             .get(item_id)
+//             .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+//         Ok(item.label.clone())
+//     }
+//
+//     pub async fn set_item_label(&self, col_id: &str, item_id: &str, label: String) -> Result<()> {
+//         let mut cols = self.collections.write().await;
+//         let col = cols
+//             .get_mut(col_id)
+//             .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         let item = col
+//             .items
+//             .get_mut(item_id)
+//             .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+//         item.label = label;
+//         item.modified = current_timestamp_secs();
+//
+//         self.persist_collection(collection_id).await?;
+//
+//         Ok(())
+//     }
+//
+//     pub async fn get_item_attributes(
+//         &self,
+//         col_id: &str,
+//         item_id: &str,
+//     ) -> Result<HashMap<String, String>> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(col_id)
+//             .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         let item = col
+//             .items
+//             .get(item_id)
+//             .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+//         Ok(item.attributes.clone())
+//     }
+//
+//     pub async fn set_item_attributes(
+//         &self,
+//         col_id: &str,
+//         item_id: &str,
+//         attributes: HashMap<String, String>,
+//     ) -> Result<()> {
+//         let mut cols = self.collections.write().await;
+//         let col = cols
+//             .get_mut(col_id)
+//             .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         let item = col
+//             .items
+//             .get_mut(item_id)
+//             .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+//         item.attributes = attributes;
+//         item.modified = current_timestamp_secs();
+//
+//         self.persist_collection(collection_id).await?;
+//
+//         Ok(())
+//     }
+//
+//     pub async fn get_item_created(&self, col_id: &str, item_id: &str) -> Result<u64> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(col_id)
+//             .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         let item = col
+//             .items
+//             .get(item_id)
+//             .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+//         Ok(item.created)
+//     }
+//
+//     pub async fn get_item_modified(&self, col_id: &str, item_id: &str) -> Result<u64> {
+//         let cols = self.collections.read().await;
+//         let col = cols
+//             .get(col_id)
+//             .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         let item = col
+//             .items
+//             .get(item_id)
+//             .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+//         Ok(item.modified)
+//     }
+// }
+
+
+
+
+//! ============================================================================
+//! ciel-keychaind - Keyring Manager & In-Memory State
+//! ============================================================================
+// use crate::config::{Config, DEFAULT_COLLECTION_ALIAS, DEFAULT_COLLECTION_NAME};
+// use crate::core::events::EventBus;
+// use crate::core::lock::LockManager;
+// use crate::core::policy::{AccessDecision, PolicyEngine};
+// use crate::core::search::matches_attributes;
+// use crate::crypto::kdf::{derive_master_key, KdfParams};
+// use crate::dbus::caller::CallerIdentity;
+// use crate::dbus::item::SecretWire;
+// use crate::dbus::session::Session;
+// use crate::error::{CielError, Result};
+// use crate::storage::{StoredItem, VaultPayload, VaultStorage};
+// use std::collections::HashMap;
+// use std::sync::atomic::{AtomicU64, Ordering};
+// use std::sync::Arc;
+// use std::time::{SystemTime, UNIX_EPOCH};
+// use tokio::sync::RwLock;
+// use tracing::{info, warn};
+// use zbus::zvariant::{OwnedObjectPath, Value};
+// use zeroize::Zeroizing;
+//
+// fn current_timestamp_secs() -> u64 {
+//     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+// }
+//
+// #[derive(Debug, Clone)]
+// pub struct ItemData {
+//     pub id: String,
+//     pub label: String,
+//     pub attributes: HashMap<String, String>,
+//     pub secret: Zeroizing<Vec<u8>>,
+//     pub content_type: String,
+//     pub created: u64,
+//     pub modified: u64,
+// }
+//
+// pub struct CollectionData {
+//     pub id: String,
+//     pub label: String,
+//     pub created: u64,
+//     pub modified: u64,
+//     pub items: HashMap<String, ItemData>,
+//     pub master_key: Option<Zeroizing<Vec<u8>>>,
+// }
+//
+// pub struct KeyringManager {
+//     config: Config,
+//     collections: Arc<RwLock<HashMap<String, CollectionData>>>,
+//     aliases: Arc<RwLock<HashMap<String, String>>>,
+//     lock_manager: Arc<LockManager>,
+//     policy_engine: Arc<PolicyEngine>,
+//     event_bus: EventBus,
+//     item_counter: AtomicU64,
+//     vault_storage: Arc<VaultStorage>,
+// }
+//
+// impl KeyringManager {
+//     pub async fn new(config: Config, vault_storage: Arc<VaultStorage>) -> Result<Self> {
+//         let event_bus = EventBus::new();
+//         let lock_manager = Arc::new(LockManager::new(config.auto_lock_timeout, event_bus.clone()));
+//         let policy_engine = Arc::new(PolicyEngine::new(config.default_access_policy));
+//
+//         let mut initial_aliases = HashMap::new();
+//         initial_aliases.insert(DEFAULT_COLLECTION_ALIAS.to_string(), DEFAULT_COLLECTION_NAME.to_string());
+//
+//         Ok(Self {
+//             config,
+//             collections: Arc::new(RwLock::new(HashMap::new())),
+//             aliases: Arc::new(RwLock::new(initial_aliases)),
+//             lock_manager,
+//             policy_engine,
+//             event_bus,
+//             item_counter: AtomicU64::new(1),
+//             vault_storage,
+//         })
+//     }
+//
+//     pub fn lock_manager(&self) -> &Arc<LockManager> { &self.lock_manager }
+//     pub fn policy_engine(&self) -> &Arc<PolicyEngine> { &self.policy_engine }
+//     pub async fn is_collection_locked(&self, collection_id: &str) -> bool {
+//         self.lock_manager.is_locked(collection_id).await
+//     }
+//
+//     pub async fn create_collection(
+//         &self, properties: HashMap<String, Value<'_>>, alias: &str, _caller: &CallerIdentity,
+//     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+//         let label = properties.get("org.freedesktop.Secret.Collection.Label")
+//             .and_then(|v| match v { Value::Str(s) => Some(s.to_string()), _ => None })
+//             .unwrap_or_else(|| "New Collection".to_string());
+//         let collection_id = label.to_lowercase().replace(' ', "_");
+//         let now = current_timestamp_secs();
+//
+//         {
+//             let mut cols = self.collections.write().await;
+//             if cols.contains_key(&collection_id) {
+//                 return Err(CielError::AlreadyExists(format!("Collection '{collection_id}' already exists")));
+//             }
+//             cols.insert(collection_id.clone(), CollectionData {
+//                 id: collection_id.clone(), label, created: now, modified: now,
+//                 items: HashMap::new(), master_key: None,
+//             });
+//         }
+//         self.lock_manager.register_unlocked(&collection_id).await;
+//         if !alias.is_empty() {
+//             self.aliases.write().await.insert(alias.to_string(), collection_id.clone());
+//         }
+//         let collection_path = OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{collection_id}"))
+//             .map_err(|e| CielError::Config(e.to_string()))?;
+//
+//         self.persist_collection(&collection_id).await?;
+//         Ok((collection_path, OwnedObjectPath::try_from("/").unwrap()))
+//     }
+//
+//     pub async fn delete_collection(&self, collection_id: &str, _caller: &CallerIdentity) -> Result<()> {
+//         self.vault_storage.delete_vault(collection_id)?;
+//         let mut cols = self.collections.write().await;
+//         if cols.remove(collection_id).is_none() {
+//             return Err(CielError::NoSuchObject(format!("No collection '{collection_id}'")));
+//         }
+//         self.lock_manager.lock(collection_id).await;
+//         Ok(())
+//     }
+//
+//     pub async fn list_all_collections(&self) -> Result<Vec<OwnedObjectPath>> {
+//         let cols = self.collections.read().await;
+//         let mut paths = Vec::with_capacity(cols.len());
+//         for id in cols.keys() {
+//             if let Ok(p) = OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{id}")) {
+//                 paths.push(p);
+//             }
+//         }
+//         Ok(paths)
+//     }
+//
+//     pub async fn list_items(&self, collection_id: &str) -> Result<Vec<OwnedObjectPath>> {
+//         let cols = self.collections.read().await;
+//         let col = cols.get(collection_id).ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//         let mut paths = Vec::with_capacity(col.items.len());
+//         for item_id in col.items.keys() {
+//             if let Ok(p) = OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{collection_id}/{item_id}")) {
+//                 paths.push(p);
+//             }
+//         }
+//         Ok(paths)
+//     }
+//
+//     pub async fn create_item(
+//         &self, collection_id: &str, properties: HashMap<String, Value<'_>>,
+//         secret_wire: SecretWire, replace: bool, _caller: &CallerIdentity,
+//     ) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+//         if self.is_collection_locked(collection_id).await {
+//             return Err(CielError::IsLocked(format!("Collection '{collection_id}' is locked")));
+//         }
+//         let label = properties.get("org.freedesktop.Secret.Item.Label")
+//             .and_then(|v| match v { Value::Str(s) => Some(s.to_string()), _ => None })
+//             .unwrap_or_else(|| "New Secret".to_string());
+//         let mut attributes = HashMap::new();
+//         if let Some(Value::Dict(dict)) = properties.get("org.freedesktop.Secret.Item.Attributes") {
+//             for (k, v) in dict.iter() {
+//                 if let (Value::Str(ks), Value::Str(vs)) = (k, v) {
+//                     attributes.insert(ks.to_string(), vs.to_string());
+//                 }
+//             }
+//         }
+//         let item_id = format!("i{}", self.item_counter.fetch_add(1, Ordering::SeqCst));
+//         let now = current_timestamp_secs();
+//         let item_data = ItemData {
+//             id: item_id.clone(), label, attributes,
+//             secret: Zeroizing::new(secret_wire.value),
+//             content_type: secret_wire.content_type, created: now, modified: now,
+//         };
+//         {
+//             let mut cols = self.collections.write().await;
+//             let col = cols.get_mut(collection_id).ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//             if replace {
+//                 col.items.retain(|_, it| !matches_attributes(&item_data.attributes, &it.attributes));
+//             }
+//             col.items.insert(item_id.clone(), item_data);
+//             col.modified = now;
+//         }
+//         self.lock_manager.touch_activity(collection_id).await;
+//         let item_path = OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{collection_id}/{item_id}"))
+//             .map_err(|e| CielError::Config(e.to_string()))?;
+//
+//         self.persist_collection(collection_id).await?;
+//         Ok((item_path, OwnedObjectPath::try_from("/").unwrap()))
+//     }
+//
+//     pub async fn delete_item(&self, collection_id: &str, item_id: &str, _caller: &CallerIdentity) -> Result<()> {
+//         if self.is_collection_locked(collection_id).await {
+//             return Err(CielError::IsLocked(format!("Collection '{collection_id}' is locked")));
+//         }
+//         let mut cols = self.collections.write().await;
+//         let col = cols.get_mut(collection_id).ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//         if col.items.remove(item_id).is_none() {
+//             return Err(CielError::NoSuchObject(format!("No item '{item_id}' in '{collection_id}'")));
+//         }
+//         col.modified = current_timestamp_secs();
+//         self.persist_collection(collection_id).await?;
+//         Ok(())
+//     }
+//
+//     pub async fn get_item_secret(&self, collection_id: &str, item_id: &str, session_path: &OwnedObjectPath, caller: &CallerIdentity) -> Result<SecretWire> {
+//         if self.is_collection_locked(collection_id).await {
+//             return Err(CielError::IsLocked(format!("Collection '{collection_id}' is locked")));
+//         }
+//         if self.policy_engine.evaluate_access(caller).await == AccessDecision::Deny {
+//             return Err(CielError::PolicyDenied(format!("Access denied to caller {:?}", caller.display_label())));
+//         }
+//         let cols = self.collections.read().await;
+//         let col = cols.get(collection_id).ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//         let item = col.items.get(item_id).ok_or_else(|| CielError::NoSuchObject(format!("No item '{item_id}'")))?;
+//         self.lock_manager.touch_activity(collection_id).await;
+//         Ok(SecretWire {
+//             session: session_path.clone(), parameters: Vec::new(),
+//             value: item.secret.to_vec(), content_type: item.content_type.clone(),
+//         })
+//     }
+//
+//     pub async fn set_item_secret(&self, collection_id: &str, item_id: &str, secret_wire: SecretWire, _caller: &CallerIdentity) -> Result<()> {
+//         if self.is_collection_locked(collection_id).await {
+//             return Err(CielError::IsLocked(format!("Collection '{collection_id}' is locked")));
+//         }
+//         let mut cols = self.collections.write().await;
+//         let col = cols.get_mut(collection_id).ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//         let item = col.items.get_mut(item_id).ok_or_else(|| CielError::NoSuchObject(format!("No item '{item_id}'")))?;
+//         item.secret = Zeroizing::new(secret_wire.value);
+//         item.content_type = secret_wire.content_type;
+//         item.modified = current_timestamp_secs();
+//         self.lock_manager.touch_activity(collection_id).await;
+//         self.persist_collection(collection_id).await?;
+//         Ok(())
+//     }
+//
+//     pub async fn search_items_in_collection(&self, collection_id: &str, attributes: &HashMap<String, String>) -> Result<Vec<OwnedObjectPath>> {
+//         let cols = self.collections.read().await;
+//         let col = cols.get(collection_id).ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//         let mut results = Vec::new();
+//         for (item_id, item) in &col.items {
+//             if matches_attributes(attributes, &item.attributes) {
+//                 if let Ok(p) = OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{collection_id}/{item_id}")) {
+//                     results.push(p);
+//                 }
+//             }
+//         }
+//         Ok(results)
+//     }
+//
+//     pub async fn search_items_global(&self, attributes: &HashMap<String, String>) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
+//         let cols = self.collections.read().await;
+//         let mut unlocked = Vec::new();
+//         let mut locked = Vec::new();
+//         for (col_id, col) in cols.iter() {
+//             let is_locked = self.lock_manager.is_locked(col_id).await;
+//             for (item_id, item) in &col.items {
+//                 if matches_attributes(attributes, &item.attributes) {
+//                     if let Ok(path) = OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{col_id}/{item_id}")) {
+//                         if is_locked { locked.push(path); } else { unlocked.push(path); }
+//                     }
+//                 }
+//             }
+//         }
+//         Ok((unlocked, locked))
+//     }
+//
+//     /// Unlocks objects (collections or items).
+//     pub async fn unlock_objects(
+//         &self,
+//         objects: Vec<OwnedObjectPath>,
+//         _caller: &CallerIdentity,
+//     ) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+//         let mut unlocked = Vec::new();
+//         let mut needs_prompt = false;
+//         let mut prompt_col_id = String::new();
+//
+//         for obj in objects {
+//             let path_str = obj.as_str();
+//             if let Some(col_id) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+//                 let actual_col_id = col_id.split('/').next().unwrap_or(col_id);
+//
+//                 // Check if it's already decrypted and in memory
+//                 let cols = self.collections.read().await;
+//                 if cols.contains_key(actual_col_id) {
+//                     unlocked.push(obj.clone());
+//                 } else {
+//                     // It's on disk but not in RAM. We NEED a password to decrypt it.
+//                     needs_prompt = true;
+//                     prompt_col_id = actual_col_id.to_string();
+//                 }
+//             }
+//         }
+//
+//         if needs_prompt {
+//             // In a full GUI implementation, we would register a Prompt object here.
+//             // For now, we log it and return a dummy prompt path to tell the client 
+//             // "I need user interaction to proceed".
+//             tracing::warn!(
+//                 "Collection '{}' is locked and not in memory. A GUI prompter or PAM unlock is required.", 
+//                 prompt_col_id
+//             );
+//             let prompt_path = OwnedObjectPath::try_from("/org/freedesktop/secrets/prompt/p1").unwrap();
+//             return Ok((unlocked, prompt_path));
+//         }
+//
+//         let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+//         Ok((unlocked, prompt_path))
+//     }
+//
+//     pub async fn lock_objects(&self, objects: Vec<OwnedObjectPath>, _caller: &CallerIdentity) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+//         let mut locked = Vec::new();
+//         for obj in objects {
+//             let path_str = obj.as_str();
+//             if let Some(col_id) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+//                 let actual_col_id = col_id.split('/').next().unwrap_or(col_id);
+//                 self.lock_manager.lock(actual_col_id).await;
+//                 if let Ok(p) = OwnedObjectPath::try_from(path_str) { locked.push(p); }
+//             }
+//         }
+//         Ok((locked, OwnedObjectPath::try_from("/").unwrap()))
+//     }
+//
+//     pub async fn lock_all(&self) {
+//         self.lock_manager.lock_all().await;
+//     }
+//
+//     pub async fn unlock_with_passphrase(&self, collection_id: &str, passphrase: &[u8]) -> Result<()> {
+//         info!("Unlocking collection '{}' via passphrase", collection_id);
+//         let kdf_params = KdfParams::default();
+//         let master_key = derive_master_key(passphrase, &kdf_params)?;
+//
+//         let payload = match self.vault_storage.load_vault_with_key(collection_id, master_key.as_slice()) {
+//             Ok(p) => p,
+//             Err(e) => {
+//                 if matches!(e, CielError::NoSuchObject(_)) {
+//                     info!("Vault '{}' not found. Creating new empty vault.", collection_id);
+//                     let now = current_timestamp_secs();
+//                     let new_payload = VaultPayload {
+//                         collection_id: collection_id.to_string(),
+//                         label: if collection_id == DEFAULT_COLLECTION_NAME { "Login Keyring".to_string() } else { collection_id.to_string() },
+//                         created: now, modified: now, items: Vec::new(),
+//                     };
+//                     self.vault_storage.save_vault_with_key(collection_id, &new_payload, master_key.as_slice(), &kdf_params)?;
+//                     new_payload
+//                 } else {
+//                     return Err(e);
+//                 }
+//             }
+//         };
+//
+//         let items = payload.items.into_iter().map(|stored| {
+//             let item = ItemData {
+//                 id: stored.id.clone(), label: stored.label, attributes: stored.attributes,
+//                 secret: Zeroizing::new(stored.secret), content_type: stored.content_type,
+//                 created: stored.created, modified: stored.modified,
+//             };
+//             (stored.id, item)
+//         }).collect();
+//
+//         let collection = CollectionData {
+//             id: payload.collection_id, label: payload.label,
+//             created: payload.created, modified: payload.modified, items,
+//             master_key: Some(Zeroizing::new(master_key.as_slice().to_vec())),
+//         };
+//
+//         {
+//             let mut cols = self.collections.write().await;
+//             cols.insert(collection_id.to_string(), collection);
+//         }
+//         self.lock_manager.unlock(collection_id).await;
+//         info!("Collection '{}' successfully unlocked and loaded into memory", collection_id);
+//         Ok(())
+//     }
+//
+//     pub async fn persist_collection(&self, collection_id: &str) -> Result<()> {
+//         let cols = self.collections.read().await;
+//         let col = cols.get(collection_id).ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+//
+//         let payload = VaultPayload {
+//             collection_id: col.id.clone(), label: col.label.clone(),
+//             created: col.created, modified: col.modified,
+//             items: col.items.values().map(|item| StoredItem {
+//                 id: item.id.clone(), label: item.label.clone(), attributes: item.attributes.clone(),
+//                 secret: item.secret.to_vec(), content_type: item.content_type.clone(),
+//                 created: item.created, modified: item.modified,
+//             }).collect(),
+//         };
+//
+//         if let Some(master_key) = &col.master_key {
+//             let kdf_params = KdfParams::default();
+//             self.vault_storage.save_vault_with_key(collection_id, &payload, master_key.as_slice(), &kdf_params)?;
+//         } else {
+//             warn!("Attempted to persist locked collection '{}'", collection_id);
+//         }
+//         Ok(())
+//     }
+//
+//     pub async fn resolve_alias(&self, name: &str) -> Result<OwnedObjectPath> {
+//         let col_id = self.aliases.read().await.get(name)
+//             .ok_or_else(|| CielError::NoSuchObject(format!("Alias '{name}' does not point to any collection")))?
+//             .clone();
+//         OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{col_id}"))
+//             .map_err(|e| CielError::Config(e.to_string()))
+//     }
+//
+//     pub async fn set_alias(&self, name: &str, collection_path: &OwnedObjectPath, _caller: &CallerIdentity) -> Result<()> {
+//         let path_str = collection_path.as_str();
+//         if path_str == "/" {
+//             self.aliases.write().await.remove(name);
+//             return Ok(());
+//         }
+//         let col_id = path_str.strip_prefix("/org/freedesktop/secrets/collection/")
+//             .ok_or_else(|| CielError::NoSuchObject("Invalid collection path for alias".into()))?;
+//         self.aliases.write().await.insert(name.to_string(), col_id.to_string());
+//         Ok(())
+//     }
+//
+//     pub async fn get_multiple_secrets(&self, items: Vec<OwnedObjectPath>, session: &Session, caller: &CallerIdentity) -> Result<HashMap<OwnedObjectPath, SecretWire>> {
+//         let mut map = HashMap::new();
+//         for item_path in items {
+//             let path_str = item_path.as_str();
+//             if let Some(rest) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+//                 let mut parts = rest.split('/');
+//                 if let (Some(col_id), Some(item_id)) = (parts.next(), parts.next()) {
+//                     let session_path = OwnedObjectPath::try_from(session.path.as_str()).map_err(|e| CielError::Config(e.to_string()))?;
+//                     if let Ok(wire) = self.get_item_secret(col_id, item_id, &session_path, caller).await {
+//                         let (parameters, value) = session.encrypt(&wire.value)?;
+//                         if let Ok(owned_path) = OwnedObjectPath::try_from(path_str) {
+//                             map.insert(owned_path, SecretWire { session: session.path.clone(), parameters, value, content_type: wire.content_type });
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+//         Ok(map)
+//     }
+//
+//     pub async fn get_collection_label(&self, id: &str) -> Result<String> {
+//         Ok(self.collections.read().await.get(id).ok_or_else(|| CielError::NoSuchObject(id.into()))?.label.clone())
+//     }
+//
+//     pub async fn set_collection_label(&self, id: &str, label: String) -> Result<()> {
+//         let mut cols = self.collections.write().await;
+//         let col = cols.get_mut(id).ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+//         col.label = label;
+//         col.modified = current_timestamp_secs();
+//         drop(cols); // FIX: Release lock before persisting
+//         self.persist_collection(id).await?; // FIX: Use 'id' instead of 'collection_id'
+//         Ok(())
+//     }
+//
+//     pub async fn get_collection_created(&self, id: &str) -> Result<u64> {
+//         Ok(self.collections.read().await.get(id).ok_or_else(|| CielError::NoSuchObject(id.into()))?.created)
+//     }
+//
+//     pub async fn get_collection_modified(&self, id: &str) -> Result<u64> {
+//         Ok(self.collections.read().await.get(id).ok_or_else(|| CielError::NoSuchObject(id.into()))?.modified)
+//     }
+//
+//     pub async fn get_item_label(&self, col_id: &str, item_id: &str) -> Result<String> {
+//         let cols = self.collections.read().await;
+//         let col = cols.get(col_id).ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         Ok(col.items.get(item_id).ok_or_else(|| CielError::NoSuchObject(item_id.into()))?.label.clone())
+//     }
+//
+//     pub async fn set_item_label(&self, col_id: &str, item_id: &str, label: String) -> Result<()> {
+//         let mut cols = self.collections.write().await;
+//         let col = cols.get_mut(col_id).ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         let item = col.items.get_mut(item_id).ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+//         item.label = label;
+//         item.modified = current_timestamp_secs();
+//         drop(cols); // FIX: Release lock before persisting
+//         self.persist_collection(col_id).await?; // FIX: Use 'col_id' instead of 'collection_id'
+//         Ok(())
+//     }
+//
+//     pub async fn get_item_attributes(&self, col_id: &str, item_id: &str) -> Result<HashMap<String, String>> {
+//         let cols = self.collections.read().await;
+//         let col = cols.get(col_id).ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         Ok(col.items.get(item_id).ok_or_else(|| CielError::NoSuchObject(item_id.into()))?.attributes.clone())
+//     }
+//
+//     pub async fn set_item_attributes(&self, col_id: &str, item_id: &str, attributes: HashMap<String, String>) -> Result<()> {
+//         let mut cols = self.collections.write().await;
+//         let col = cols.get_mut(col_id).ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         let item = col.items.get_mut(item_id).ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+//         item.attributes = attributes;
+//         item.modified = current_timestamp_secs();
+//         drop(cols); // FIX: Release lock before persisting
+//         self.persist_collection(col_id).await?; // FIX: Use 'col_id' instead of 'collection_id'
+//         Ok(())
+//     }
+//
+//     pub async fn get_item_created(&self, col_id: &str, item_id: &str) -> Result<u64> {
+//         let cols = self.collections.read().await;
+//         let col = cols.get(col_id).ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         Ok(col.items.get(item_id).ok_or_else(|| CielError::NoSuchObject(item_id.into()))?.created)
+//     }
+//
+//     pub async fn get_item_modified(&self, col_id: &str, item_id: &str) -> Result<u64> {
+//         let cols = self.collections.read().await;
+//         let col = cols.get(col_id).ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+//         Ok(col.items.get(item_id).ok_or_else(|| CielError::NoSuchObject(item_id.into()))?.modified)
+//     }
+// }
+
+
+
+//! ============================================================================
+//! ciel-keychaind - Keyring Manager & In-Memory State
+//!
+//! Orchestrates the in-memory hierarchy of collections and items:
+//! - Thread-safe access to collections and item properties.
+//! - Enforces lock status via [`LockManager`].
+//! - Enforces authorization via [`PolicyEngine`].
+//! - Handles PAM password-based unlock and disk persistence synchronization.
+//!
+//! ============================================================================
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use tracing::{info, warn};
+use zbus::zvariant::{OwnedObjectPath, Value};
+use zeroize::Zeroizing;
+
+use crate::config::{Config, DEFAULT_COLLECTION_ALIAS, DEFAULT_COLLECTION_NAME};
+use crate::core::events::EventBus;
+use crate::core::lock::LockManager;
+use crate::core::policy::{AccessDecision, PolicyEngine};
+use crate::core::search::matches_attributes;
+use crate::crypto::kdf::{derive_master_key, KdfParams};
+use crate::dbus::caller::CallerIdentity;
+use crate::dbus::item::SecretWire;
+use crate::dbus::session::Session;
+use crate::error::{CielError, Result};
+use crate::storage::{StoredItem, VaultPayload, VaultStorage};
+/// Current UNIX timestamp in seconds.
+fn current_timestamp_secs() -> u64 {
+SystemTime::now()
+.duration_since(UNIX_EPOCH)
+.unwrap_or_default()
+.as_secs()
+}
+/// In-memory representation of an individual stored item.
+#[derive(Debug, Clone)]
+pub struct ItemData {
+pub id: String,
+pub label: String,
+pub attributes: HashMap<String, String>,
+pub secret: Zeroizing<Vec<u8>>,
+pub content_type: String,
+pub created: u64,
+pub modified: u64,
+}
+/// In-memory representation of a collection vault.
+pub struct CollectionData {
+pub id: String,
+pub label: String,
+pub created: u64,
+pub modified: u64,
+pub items: HashMap<String, ItemData>,
+pub master_key: Option<Zeroizing<Vec<u8>>>,
+}
+/// Central orchestrator managing keyrings, items, aliases, and lifecycle operations.
+pub struct KeyringManager {
+config: Config,
+collections: Arc<RwLock<HashMap<String, CollectionData>>>,
+aliases: Arc<RwLock<HashMap<String, String>>>,
+lock_manager: Arc<LockManager>,
+policy_engine: Arc<PolicyEngine>,
+event_bus: EventBus,
+item_counter: AtomicU64,
+vault_storage: Arc<VaultStorage>,
+}
+impl KeyringManager {
+/// Initializes a new KeyringManager with vault persistence.
+pub async fn new(config: Config, vault_storage: Arc<VaultStorage>) -> Result<Self> {
+let event_bus = EventBus::new();
+let lock_manager = Arc::new(LockManager::new(
+config.auto_lock_timeout,
+event_bus.clone(),
+));
+let policy_engine = Arc::new(PolicyEngine::new(config.default_access_policy));
+    let mut initial_aliases = HashMap::new();
+    initial_aliases.insert(
+        DEFAULT_COLLECTION_ALIAS.to_string(),
+        DEFAULT_COLLECTION_NAME.to_string(),
+    );
+
+    let manager = Self {
+        config,
+        collections: Arc::new(RwLock::new(HashMap::new())),
+        aliases: Arc::new(RwLock::new(initial_aliases)),
+        lock_manager,
+        policy_engine,
+        event_bus,
+        item_counter: AtomicU64::new(1),
+        vault_storage,
+    };
+
+    // FIRST-RUN AUTO-UNLOCK:
+    // If the default vault doesn't exist yet, create and unlock it with a test passphrase
+    // so `secret-tool` works out of the box without manual PAM simulation.
+    let vault_path = manager.vault_storage.vault_file_path(DEFAULT_COLLECTION_NAME);
+    if !vault_path.exists() {
+        info!("First run detected: auto-creating and unlocking default collection.");
+        let test_passphrase = b"ciel-test-auto-unlock-passphrase";
+        manager.unlock_with_passphrase(DEFAULT_COLLECTION_NAME, test_passphrase).await?;
+    }
+
+    Ok(manager)
+}
+
+/// Access the internal lock manager.
+pub fn lock_manager(&self) -> &Arc<LockManager> {
+    &self.lock_manager
+}
+
+/// Access the internal policy engine.
+pub fn policy_engine(&self) -> &Arc<PolicyEngine> {
+    &self.policy_engine
+}
+
+/// Returns `true` if the specified collection is locked.
+pub async fn is_collection_locked(&self, collection_id: &str) -> bool {
+    self.lock_manager.is_locked(collection_id).await
+}
+
+/// Creates a new collection given properties and an optional alias.
+pub async fn create_collection(
+    &self,
+    properties: HashMap<String, Value<'_>>,
+    alias: &str,
+    _caller: &CallerIdentity,
+) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+    let label = properties
+        .get("org.freedesktop.Secret.Collection.Label")
+        .and_then(|v| match v {
+            Value::Str(s) => Some(s.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "New Collection".to_string());
+
+    let collection_id = label.to_lowercase().replace(' ', "_");
+    let now = current_timestamp_secs();
+
+    {
+        let mut cols = self.collections.write().await;
+        if cols.contains_key(&collection_id) {
+            return Err(CielError::AlreadyExists(format!(
+                "Collection '{collection_id}' already exists"
+            )));
+        }
+
+        cols.insert(
+            collection_id.clone(),
+            CollectionData {
+                id: collection_id.clone(),
+                label,
+                created: now,
+                modified: now,
+                items: HashMap::new(),
+                master_key: None,
+            },
+        );
+    }
+
+    self.lock_manager.register_unlocked(&collection_id).await;
+
+    if !alias.is_empty() {
+        let mut aliases = self.aliases.write().await;
+        aliases.insert(alias.to_string(), collection_id.clone());
+    }
+
+    let collection_path = OwnedObjectPath::try_from(format!(
+        "/org/freedesktop/secrets/collection/{collection_id}"
+    ))
+    .map_err(|e| CielError::Config(e.to_string()))?;
+    let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+
+    self.persist_collection(&collection_id).await?;
+
+    Ok((collection_path, prompt_path))
+}
+
+/// Deletes a collection and purges all contained items.
+pub async fn delete_collection(
+    &self,
+    collection_id: &str,
+    _caller: &CallerIdentity,
+) -> Result<()> {
+    self.vault_storage.delete_vault(collection_id)?;
+
+    let mut cols = self.collections.write().await;
+    if cols.remove(collection_id).is_none() {
+        return Err(CielError::NoSuchObject(format!(
+            "No collection '{collection_id}'"
+        )));
+    }
+
+    self.lock_manager.lock(collection_id).await;
+    Ok(())
+}
+
+/// Lists all known collections.
+pub async fn list_all_collections(&self) -> Result<Vec<OwnedObjectPath>> {
+    let cols = self.collections.read().await;
+    let mut paths = Vec::with_capacity(cols.len());
+    for id in cols.keys() {
+        if let Ok(p) =
+            OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{id}"))
+        {
+            paths.push(p);
+        }
+    }
+    Ok(paths)
+}
+
+/// Lists all item object paths in a collection.
+pub async fn list_items(&self, collection_id: &str) -> Result<Vec<OwnedObjectPath>> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(collection_id)
+        .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+
+    let mut paths = Vec::with_capacity(col.items.len());
+    for item_id in col.items.keys() {
+        if let Ok(p) = OwnedObjectPath::try_from(format!(
+            "/org/freedesktop/secrets/collection/{collection_id}/{item_id}"
+        )) {
+            paths.push(p);
+        }
+    }
+    Ok(paths)
+}
+
+/// Creates a new secret item inside a collection.
+pub async fn create_item(
+    &self,
+    collection_id: &str,
+    properties: HashMap<String, Value<'_>>,
+    secret_wire: SecretWire,
+    replace: bool,
+    _caller: &CallerIdentity,
+) -> Result<(OwnedObjectPath, OwnedObjectPath)> {
+    if self.is_collection_locked(collection_id).await {
+        return Err(CielError::IsLocked(format!(
+            "Collection '{collection_id}' is locked"
+        )));
+    }
+
+    let label = properties
+        .get("org.freedesktop.Secret.Item.Label")
+        .and_then(|v| match v {
+            Value::Str(s) => Some(s.to_string()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "New Secret".to_string());
+
+    let mut attributes = HashMap::new();
+    if let Some(Value::Dict(dict)) = properties.get("org.freedesktop.Secret.Item.Attributes") {
+        for (k, v) in dict.iter() {
+            if let (Value::Str(ks), Value::Str(vs)) = (k, v) {
+                attributes.insert(ks.to_string(), vs.to_string());
+            }
+        }
+    }
+
+    let item_id = format!("i{}", self.item_counter.fetch_add(1, Ordering::SeqCst));
+    let now = current_timestamp_secs();
+
+    let item_data = ItemData {
+        id: item_id.clone(),
+        label,
+        attributes,
+        secret: Zeroizing::new(secret_wire.value),
+        content_type: secret_wire.content_type,
+        created: now,
+        modified: now,
+    };
+
+    {
+        let mut cols = self.collections.write().await;
+        let col = cols.get_mut(collection_id).ok_or_else(|| {
+            CielError::NoSuchObject(format!("No collection '{collection_id}'"))
+        })?;
+
+        if replace {
+            // If replace is true, purge existing item matching identical attributes
+            col.items
+                .retain(|_, it| !matches_attributes(&item_data.attributes, &it.attributes));
+        }
+
+        col.items.insert(item_id.clone(), item_data);
+        col.modified = now;
+    }
+
+    self.lock_manager.touch_activity(collection_id).await;
+    let item_path = OwnedObjectPath::try_from(format!(
+        "/org/freedesktop/secrets/collection/{collection_id}/{item_id}"
+    ))
+    .map_err(|e| CielError::Config(e.to_string()))?;
+    let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+
+    self.persist_collection(collection_id).await?;
+
+    Ok((item_path, prompt_path))
+}
+
+/// Deletes an item from a collection.
+pub async fn delete_item(
+    &self,
+    collection_id: &str,
+    item_id: &str,
+    _caller: &CallerIdentity,
+) -> Result<()> {
+    if self.is_collection_locked(collection_id).await {
+        return Err(CielError::IsLocked(format!(
+            "Collection '{collection_id}' is locked"
+        )));
+    }
+
+    let mut cols = self.collections.write().await;
+    let col = cols
+        .get_mut(collection_id)
+        .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+
+    if col.items.remove(item_id).is_none() {
+        return Err(CielError::NoSuchObject(format!(
+            "No item '{item_id}' in '{collection_id}'"
+        )));
+    }
+
+    col.modified = current_timestamp_secs();
+
+    self.persist_collection(collection_id).await?;
+
+    Ok(())
+}
+
+/// Reads and encrypts an item's secret for the caller's session.
+pub async fn get_item_secret(
+    &self,
+    collection_id: &str,
+    item_id: &str,
+    session_path: &OwnedObjectPath,
+    caller: &CallerIdentity,
+) -> Result<SecretWire> {
+    if self.is_collection_locked(collection_id).await {
+        return Err(CielError::IsLocked(format!(
+            "Collection '{collection_id}' is locked"
+        )));
+    }
+
+    // Authorize caller via policy engine
+    let decision = self.policy_engine.evaluate_access(caller).await;
+    if decision == AccessDecision::Deny {
+        return Err(CielError::PolicyDenied(format!(
+            "Access denied to caller {:?}",
+            caller.display_label()
+        )));
+    }
+
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(collection_id)
+        .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+
+    let item = col
+        .items
+        .get(item_id)
+        .ok_or_else(|| CielError::NoSuchObject(format!("No item '{item_id}'")))?;
+
+    self.lock_manager.touch_activity(collection_id).await;
+
+    Ok(SecretWire {
+        session: session_path.clone(),
+        parameters: Vec::new(),
+        value: item.secret.to_vec(),
+        content_type: item.content_type.clone(),
+    })
+}
+
+/// Updates an item's secret value.
+pub async fn set_item_secret(
+    &self,
+    collection_id: &str,
+    item_id: &str,
+    secret_wire: SecretWire,
+    _caller: &CallerIdentity,
+) -> Result<()> {
+    if self.is_collection_locked(collection_id).await {
+        return Err(CielError::IsLocked(format!(
+            "Collection '{collection_id}' is locked"
+        )));
+    }
+
+    let mut cols = self.collections.write().await;
+    let col = cols
+        .get_mut(collection_id)
+        .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+
+    let item = col
+        .items
+        .get_mut(item_id)
+        .ok_or_else(|| CielError::NoSuchObject(format!("No item '{item_id}'")))?;
+
+    item.secret = Zeroizing::new(secret_wire.value);
+    item.content_type = secret_wire.content_type;
+    item.modified = current_timestamp_secs();
+
+    self.lock_manager.touch_activity(collection_id).await;
+
+    self.persist_collection(collection_id).await?;
+
+    Ok(())
+}
+
+/// Performs attribute search within a single collection.
+pub async fn search_items_in_collection(
+    &self,
+    collection_id: &str,
+    attributes: &HashMap<String, String>,
+) -> Result<Vec<OwnedObjectPath>> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(collection_id)
+        .ok_or_else(|| CielError::NoSuchObject(format!("No collection '{collection_id}'")))?;
+
+    let mut results = Vec::new();
+    for (item_id, item) in &col.items {
+        if matches_attributes(attributes, &item.attributes) {
+            if let Ok(p) = OwnedObjectPath::try_from(format!(
+                "/org/freedesktop/secrets/collection/{collection_id}/{item_id}"
+            )) {
+                results.push(p);
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Performs global attribute search across all collections, returning unlocked and locked items.
+pub async fn search_items_global(
+    &self,
+    attributes: &HashMap<String, String>,
+) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>)> {
+    let cols = self.collections.read().await;
+    let mut unlocked = Vec::new();
+    let mut locked = Vec::new();
+
+    for (col_id, col) in cols.iter() {
+        let is_locked = self.lock_manager.is_locked(col_id).await;
+        for (item_id, item) in &col.items {
+            if matches_attributes(attributes, &item.attributes) {
+                if let Ok(path) = OwnedObjectPath::try_from(format!(
+                    "/org/freedesktop/secrets/collection/{col_id}/{item_id}"
+                )) {
+                    if is_locked {
+                        locked.push(path);
+                    } else {
+                        unlocked.push(path);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((unlocked, locked))
+}
+
+/// Unlocks objects (collections or items).
+pub async fn unlock_objects(
+    &self,
+    objects: Vec<OwnedObjectPath>,
+    _caller: &CallerIdentity,
+) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+    let mut unlocked = Vec::new();
+    let mut needs_prompt = false;
+    let mut prompt_col_id = String::new();
+
+    for obj in objects {
+        let path_str = obj.as_str();
+        if let Some(col_id) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+            let actual_col_id = col_id.split('/').next().unwrap_or(col_id);
+
+            // Check if it's already decrypted and in memory
+            let cols = self.collections.read().await;
+            if cols.contains_key(actual_col_id) {
+                unlocked.push(obj.clone());
+            } else {
+                // It's on disk but not in RAM. We NEED a password to decrypt it.
+                needs_prompt = true;
+                prompt_col_id = actual_col_id.to_string();
+            }
+        }
+    }
+
+    if needs_prompt {
+        warn!(
+            "Collection '{}' is locked and not in memory. A GUI prompter or PAM unlock is required.",
+            prompt_col_id
+        );
+        let prompt_path = OwnedObjectPath::try_from("/org/freedesktop/secrets/prompt/p1").unwrap();
+        return Ok((unlocked, prompt_path));
+    }
+
+    let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+    Ok((unlocked, prompt_path))
+}
+
+/// Locks objects (collections or items).
+pub async fn lock_objects(
+    &self,
+    objects: Vec<OwnedObjectPath>,
+    _caller: &CallerIdentity,
+) -> Result<(Vec<OwnedObjectPath>, OwnedObjectPath)> {
+    let mut locked = Vec::new();
+
+    for obj in objects {
+        let path_str = obj.as_str();
+        if let Some(col_id) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+            let actual_col_id = col_id.split('/').next().unwrap_or(col_id);
+            self.lock_collection(actual_col_id).await?;
+            if let Ok(p) = OwnedObjectPath::try_from(path_str) {
+                locked.push(p);
+            }
+        }
+    }
+
+    let prompt_path = OwnedObjectPath::try_from("/").unwrap();
+    Ok((locked, prompt_path))
+}
+
+/// Locks all collections immediately.
+pub async fn lock_all(&self) {
+    let cols = self.collections.read().await;
+    let ids: Vec<String> = cols.keys().cloned().collect();
+    drop(cols);
+    for id in ids {
+        let _ = self.lock_collection(&id).await;
+    }
+}
+
+/// Unlocks a collection directly with a raw passphrase (invoked by PAM module).
+pub async fn unlock_with_passphrase(&self, collection_id: &str, passphrase: &[u8]) -> Result<()> {
+    info!("Unlocking collection '{}' via passphrase", collection_id);
+
+    // 1. Derive master key once (avoids re-deriving on every save)
+    let kdf_params = KdfParams::default();
+    let master_key = derive_master_key(passphrase, &kdf_params)?;
+
+    // 2. Try to load. If it doesn't exist, create an empty vault.
+    let payload = match self.vault_storage.load_vault_with_key(collection_id, master_key.as_slice()) {
+        Ok(p) => p,
+        Err(e) => {
+            if matches!(e, CielError::NoSuchObject(_)) {
+                info!("Vault '{}' not found. Creating new empty vault.", collection_id);
+                let now = current_timestamp_secs();
+                let new_payload = VaultPayload {
+                    collection_id: collection_id.to_string(),
+                    label: if collection_id == DEFAULT_COLLECTION_NAME {
+                        "Login Keyring".to_string()
+                    } else {
+                        collection_id.to_string()
+                    },
+                    created: now,
+                    modified: now,
+                    items: Vec::new(),
+                };
+                self.vault_storage.save_vault_with_key(
+                    collection_id,
+                    &new_payload,
+                    master_key.as_slice(),
+                    &kdf_params,
+                )?;
+                new_payload
+            } else {
+                return Err(e);
+            }
+        }
+    };
+
+    // 3. Convert on-disk payload to in-memory representation
+    let items = payload.items.into_iter().map(|stored| {
+        let item = ItemData {
+            id: stored.id.clone(),
+            label: stored.label,
+            attributes: stored.attributes,
+            secret: Zeroizing::new(stored.secret),
+            content_type: stored.content_type,
+            created: stored.created,
+            modified: stored.modified,
+        };
+        (stored.id, item)
+    }).collect();
+
+    let collection = CollectionData {
+        id: payload.collection_id,
+        label: payload.label,
+        created: payload.created,
+        modified: payload.modified,
+        items,
+        master_key: Some(Zeroizing::new(master_key.as_slice().to_vec())),
+    };
+
+    // 4. Store in memory and mark unlocked
+    {
+        let mut cols = self.collections.write().await;
+        cols.insert(collection_id.to_string(), collection);
+    }
+    self.lock_manager.unlock(collection_id).await;
+
+    info!("Collection '{}' successfully unlocked and loaded into memory", collection_id);
+    Ok(())
+}
+
+/// Locks a collection and zeroizes secrets from memory.
+pub async fn lock_collection(&self, collection_id: &str) -> Result<()> {
+    let mut cols = self.collections.write().await;
+    let col = cols.get_mut(collection_id).ok_or_else(|| {
+        CielError::NoSuchObject(format!("No collection '{collection_id}'"))
+    })?;
+
+    // Zeroize all secrets in RAM
+    for item in col.items.values_mut() {
+        item.secret = Zeroizing::new(vec![]);
+    }
+
+    // Remove the cached master key
+    col.master_key = None;
+
+    self.lock_manager.lock(collection_id).await;
+    info!("Collection '{}' locked and secrets zeroized", collection_id);
+    Ok(())
+}
+
+/// Persists a collection to disk using its cached master key.
+pub async fn persist_collection(&self, collection_id: &str) -> Result<()> {
+    let cols = self.collections.read().await;
+    let col = cols.get(collection_id).ok_or_else(|| {
+        CielError::NoSuchObject(format!("No collection '{collection_id}'"))
+    })?;
+
+    let payload = VaultPayload {
+        collection_id: col.id.clone(),
+        label: col.label.clone(),
+        created: col.created,
+        modified: col.modified,
+        items: col.items.values().map(|item| StoredItem {
+            id: item.id.clone(),
+            label: item.label.clone(),
+            attributes: item.attributes.clone(),
+            secret: item.secret.to_vec(),
+            content_type: item.content_type.clone(),
+            created: item.created,
+            modified: item.modified,
+        }).collect(),
+    };
+
+    if let Some(master_key) = &col.master_key {
+        let kdf_params = KdfParams::default();
+        self.vault_storage.save_vault_with_key(
+            collection_id,
+            &payload,
+            master_key.as_slice(),
+            &kdf_params,
+        )?;
+    } else {
+        warn!("Attempted to persist locked collection '{}'", collection_id);
+    }
+    Ok(())
+}
+
+/// Resolves an alias name (e.g., `default`) to its target collection object path.
+pub async fn resolve_alias(&self, name: &str) -> Result<OwnedObjectPath> {
+    let aliases = self.aliases.read().await;
+    let col_id = aliases.get(name).ok_or_else(|| {
+        CielError::NoSuchObject(format!("Alias '{name}' does not point to any collection"))
+    })?;
+
+    OwnedObjectPath::try_from(format!("/org/freedesktop/secrets/collection/{col_id}"))
+        .map_err(|e| CielError::Config(e.to_string()))
+}
+
+/// Sets or updates an alias.
+pub async fn set_alias(
+    &self,
+    name: &str,
+    collection_path: &OwnedObjectPath,
+    _caller: &CallerIdentity,
+) -> Result<()> {
+    let path_str = collection_path.as_str();
+    if path_str == "/" {
+        let mut aliases = self.aliases.write().await;
+        aliases.remove(name);
+        return Ok(());
+    }
+
+    let col_id = path_str
+        .strip_prefix("/org/freedesktop/secrets/collection/")
+        .ok_or_else(|| CielError::NoSuchObject("Invalid collection path for alias".into()))?;
+
+    let mut aliases = self.aliases.write().await;
+    aliases.insert(name.to_string(), col_id.to_string());
+    Ok(())
+}
+
+/// Bulk retrieves secrets for multiple items for a given session.
+pub async fn get_multiple_secrets(
+    &self,
+    items: Vec<OwnedObjectPath>,
+    session: &Session,
+    caller: &CallerIdentity,
+) -> Result<HashMap<OwnedObjectPath, SecretWire>> {
+    let mut map = HashMap::new();
+    for item_path in items {
+        let path_str = item_path.as_str();
+        if let Some(rest) = path_str.strip_prefix("/org/freedesktop/secrets/collection/") {
+            let mut parts = rest.split('/');
+            if let (Some(col_id), Some(item_id)) = (parts.next(), parts.next()) {
+                let session_path = OwnedObjectPath::try_from(session.path.as_str())
+                    .map_err(|e| CielError::Config(e.to_string()))?;
+
+                if let Ok(wire) = self
+                    .get_item_secret(col_id, item_id, &session_path, caller)
+                    .await
+                {
+                    // Encrypt the plaintext secret with the session's key before returning!
+                    let (parameters, value) = session.encrypt(&wire.value)?;
+
+                    let encrypted_wire = SecretWire {
+                        session: session.path.clone(),
+                        parameters,
+                        value,
+                        content_type: wire.content_type,
+                    };
+
+                    if let Ok(owned_path) = OwnedObjectPath::try_from(path_str) {
+                        map.insert(owned_path, encrypted_wire);
+                    }
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+// Property getters and setters
+pub async fn get_collection_label(&self, id: &str) -> Result<String> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(id)
+        .ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+    Ok(col.label.clone())
+}
+
+pub async fn set_collection_label(&self, id: &str, label: String) -> Result<()> {
+    let mut cols = self.collections.write().await;
+    let col = cols
+        .get_mut(id)
+        .ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+    col.label = label;
+    col.modified = current_timestamp_secs();
+    drop(cols);
+    self.persist_collection(id).await?;
+    Ok(())
+}
+
+pub async fn get_collection_created(&self, id: &str) -> Result<u64> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(id)
+        .ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+    Ok(col.created)
+}
+
+pub async fn get_collection_modified(&self, id: &str) -> Result<u64> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(id)
+        .ok_or_else(|| CielError::NoSuchObject(id.into()))?;
+    Ok(col.modified)
+}
+
+pub async fn get_item_label(&self, col_id: &str, item_id: &str) -> Result<String> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(col_id)
+        .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+    let item = col
+        .items
+        .get(item_id)
+        .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+    Ok(item.label.clone())
+}
+
+pub async fn set_item_label(&self, col_id: &str, item_id: &str, label: String) -> Result<()> {
+    let mut cols = self.collections.write().await;
+    let col = cols
+        .get_mut(col_id)
+        .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+    let item = col
+        .items
+        .get_mut(item_id)
+        .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+    item.label = label;
+    item.modified = current_timestamp_secs();
+    drop(cols);
+    self.persist_collection(col_id).await?;
+    Ok(())
+}
+
+pub async fn get_item_attributes(
+    &self,
+    col_id: &str,
+    item_id: &str,
+) -> Result<HashMap<String, String>> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(col_id)
+        .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+    let item = col
+        .items
+        .get(item_id)
+        .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+    Ok(item.attributes.clone())
+}
+
+pub async fn set_item_attributes(
+    &self,
+    col_id: &str,
+    item_id: &str,
+    attributes: HashMap<String, String>,
+) -> Result<()> {
+    let mut cols = self.collections.write().await;
+    let col = cols
+        .get_mut(col_id)
+        .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+    let item = col
+        .items
+        .get_mut(item_id)
+        .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+    item.attributes = attributes;
+    item.modified = current_timestamp_secs();
+    drop(cols);
+    self.persist_collection(col_id).await?;
+    Ok(())
+}
+
+pub async fn get_item_created(&self, col_id: &str, item_id: &str) -> Result<u64> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(col_id)
+        .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+    let item = col
+        .items
+        .get(item_id)
+        .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+    Ok(item.created)
+}
+
+pub async fn get_item_modified(&self, col_id: &str, item_id: &str) -> Result<u64> {
+    let cols = self.collections.read().await;
+    let col = cols
+        .get(col_id)
+        .ok_or_else(|| CielError::NoSuchObject(col_id.into()))?;
+    let item = col
+        .items
+        .get(item_id)
+        .ok_or_else(|| CielError::NoSuchObject(item_id.into()))?;
+    Ok(item.modified)
+}
+}
+

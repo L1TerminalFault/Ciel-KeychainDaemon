@@ -1,0 +1,26 @@
+# ==============================================================================
+# ciel-keychainctl - Command-Line Management Utility Manifest
+#
+# Provides administrative control over ciel-keychaind keyrings and items via D-Bus.
+# ==============================================================================
+
+[package]
+name = "ciel-keychainctl"
+description = "Command-line management utility for ciel-keychaind"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ciel-keychainctl"
+path = "src/main.rs"
+
+[dependencies]
+ciel-keychaind-proto = { path = "../ciel-keychaind-proto" }
+tokio = { workspace = true }
+zbus = { workspace = true }
+zeroize = { workspace = true, features = ["alloc"] }
+serde = { workspace = true }
+serde_json = { workspace = true }

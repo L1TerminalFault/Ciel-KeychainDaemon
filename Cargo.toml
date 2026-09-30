@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ciel-keychaind",
+    "crates/ciel-keychaind-proto",
+    "crates/ciel-keychaind-pam",
+    "crates/ciel-keychaind-prompter",
+    "crates/ciel-keychainctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+rust-version = "1.75"
+edition = "2021"
+authors = ["ciel-keychaind developers"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/ciel-keychaind"
+
+[workspace.dependencies]
+# Internal workspace crates
+ciel-keychaind-proto = { path = "crates/ciel-keychaind-proto" }
+async-trait = "0.1"
+futures-util = "0.3.34"
+
+# Async runtime & D-Bus
+tokio = { version = "1.38.2", features = ["full"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+zvariant = "5.15.0"
+
+# Cryptography & Security
+argon2 = "0.6.0"
+chacha20poly1305 = "0.11.0"
+aes = "0.9.3"
+cbc = { version = "0.2.1", features = ["alloc"] }
+cipher = { version = "0.5.2", features = ["block-padding"] }
+sha2 = "0.11.0"
+rand = "0.10.3"
+zeroize = { version = "1.8.2", features = ["derive"] }
+subtle = "2.6"
+num-bigint = { version = "0.5.1", features = ["rand_0_10"] }
+hkdf = "0.13"
+
+# Serialization & Data
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.9", features = ["v4", "serde"] }
+
+# Linux OS & System Integration
+nix = { version = "0.31.3", features = ["user", "socket", "mman", "process", "uio", "resource"] }
+libc = "0.2"
+sd-notify = "0.5.0"
+
+# Error Handling & Diagnostics
+thiserror = "2.0.21"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4.34"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
