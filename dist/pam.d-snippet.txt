@@ -1,8 +1,8 @@
 # In auth section (after pam_unix.so):
-auth    optional    pam_secretd.so
+auth    optional    pam_ciel_keychaind.so
 
 # In session section (after pam_systemd.so):
-session optional    pam_secretd.so auto_start
+session optional    pam_ciel_keychaind.so auto_start
 
 # In password section (after pam_unix.so):
-password optional   pam_secretd.so
+password optional   pam_ciel_keychaind.so

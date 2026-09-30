@@ -1,4 +1,4 @@
-# secretd Threat Model & Hardening
+# ciel-keychaind Threat Model & Hardening
 
 1. **Unprivileged Co-tenant Processes (same UID)**:
    - `prctl(PR_SET_DUMPABLE, 0)`: Disables ptrace and /proc/$PID/mem access from non-root.
